@@ -17,6 +17,14 @@ with no further configuration: no composite build, no `:path` override, and no
 Unlike `firebase-android-sdk`, this repo is **not stripped** — it is small, and
 `example/` is how a change is verified without rebuilding the Kraaft app.
 
+Its README says to `yarn install` here first; inside the monorepo do not — pnpm
+already installed this package and built `lib/`, and yarn would fight it. Only
+`cd example && yarn install` is needed, then `npx expo prebuild --platform
+android` and `cd android && ANDROID_SERIAL=<serial> ./gradlew installDebug`
+(`expo run:android --device <serial>` does not resolve a serial). The example's
+own `node_modules` nests a second react-native inside the workspace, so the
+Kraaft app's `native/metro.config.js` blocks that path from haste.
+
 ## Branches
 
 - `kraaft/v4` — what the app builds. Based on `main` at 4.6.3, plus the
@@ -41,6 +49,11 @@ could not prevent it: those notifications are posted by the JobScheduler
 through `setNotification`, not by `NotificationManager`, so the group key the
 library set on them never applied, and the aggregate it posted separately was
 just one more entry beside them.
+
+Verified on a Samsung SM-A566B (Android 16) with this repo's `example/`, five
+downloads started at once, `showNotifications` + `grouping` + `summaryOnly` all
+on: upstream posts seven notifications (ids `86310`-`86314`, one per file, plus
+two summaries), the fork posts one (`303214`).
 
 `UIDTNotificationIds` is what kept them apart — it exists to guarantee each
 download a *distinct* notification id. Jobs of one group now share an id
