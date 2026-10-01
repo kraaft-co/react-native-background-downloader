@@ -239,8 +239,23 @@ class UIDTDownloadJobService : JobService() {
         RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "onStartJob: configId=$configId, startByte=$startByte, headers=${headers.size}")
 
         // Create notification for UIDT job (required)
-        val notificationId = UIDTNotificationManager.getNotificationIdForConfig(configId)
-        val notification = UIDTNotificationManager.createDownloadNotification(this, configId, groupId, groupName, customTitle)
+        // Every job of a group shares one notification id, which is how the platform
+        // collapses them: "If separate jobs use the same notification ID, the most
+        // recently provided notification will be shown to the user".
+        val sharesGroupNotification = UIDTNotificationManager.sharesGroupNotification(groupId)
+        val notificationId = if (sharesGroupNotification)
+            UIDTNotificationManager.getNotificationIdForGroup(groupId)
+        else
+            UIDTNotificationManager.getNotificationIdForConfig(configId)
+        // Built without the groupId when shared, so the one notification left is the
+        // visible one rather than the blank placeholder summaryOnly gives each job.
+        val notification = UIDTNotificationManager.createDownloadNotification(
+            this,
+            configId,
+            if (sharesGroupNotification) "" else groupId,
+            groupName,
+            customTitle
+        )
 
         // Set the notification for this job (required for UIDT)
         setNotification(params, notificationId, notification, JOB_END_NOTIFICATION_POLICY_DETACH)
@@ -460,7 +475,11 @@ class UIDTDownloadJobService : JobService() {
 
                 // Use setNotification with REMOVE policy to tell Android to remove the UIDT-controlled notification
                 // This is required because UIDT notifications are managed by the system, not NotificationManager
-                if (notificationId != null) {
+                // A shared notification belongs to the group, so only the last job may take
+                // it down: otherwise the first to finish removes it while the others are
+                // still transferring.
+                val mayRemoveNotification = remainingInGroup == 0 || groupId.isEmpty()
+                if (notificationId != null && mayRemoveNotification) {
                     val emptyNotification = UIDTNotificationManager.createEmptyNotification(this@UIDTDownloadJobService)
                     setNotification(params, notificationId, emptyNotification, JOB_END_NOTIFICATION_POLICY_REMOVE)
                     RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Set REMOVE policy for notification $notificationId")
@@ -504,7 +523,8 @@ class UIDTDownloadJobService : JobService() {
                 }
 
                 // Use setNotification with REMOVE policy to tell Android to remove the UIDT-controlled notification
-                if (notificationId != null) {
+                val mayRemoveNotification = remainingInGroup == 0 || groupId.isEmpty()
+                if (notificationId != null && mayRemoveNotification) {
                     val emptyNotification = UIDTNotificationManager.createEmptyNotification(this@UIDTDownloadJobService)
                     setNotification(params, notificationId, emptyNotification, JOB_END_NOTIFICATION_POLICY_REMOVE)
                     RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Set REMOVE policy for notification $notificationId (error)")

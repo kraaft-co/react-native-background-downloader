@@ -37,6 +37,20 @@ object UIDTNotificationManager {
         UIDTNotificationIds.progressIdFor(configId)
 
     /**
+     * One id for every job of a group, so the platform shows a single system
+     * notification for the batch. Range 300000.. is disjoint from the progress
+     * and finished ranges.
+     */
+    fun getNotificationIdForGroup(groupId: String): Int =
+        300000 + ((groupId.hashCode() and 0x7FFFFFFF) % 100000)
+
+    /** Whether this group's jobs all hang their notification on the same id. */
+    fun sharesGroupNotification(groupId: String): Boolean =
+        groupId.isNotEmpty() &&
+            config.groupingEnabled &&
+            config.mode == NotificationGroupingMode.SUMMARY_ONLY
+
+    /**
      * Notification ID for the one-shot "download complete" notification.
      * Lives in a disjoint range from [getNotificationIdForConfig] so it can
      * never collide with another download's in-progress notification.
@@ -381,6 +395,14 @@ object UIDTNotificationManager {
             return
         }
 
+        // This posts a standalone notification on its own id, which is a second entry
+        // once a group shares one. Callers reaching it directly rather than through
+        // updateSummaryNotificationForGroup skip the mode check, so it is enforced here.
+        if (sharesGroupNotification(groupId)) {
+            updateSummaryNotificationWithProgress(context, groupId, groupName)
+            return
+        }
+
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         // Count active downloads for this specific group
@@ -469,12 +491,15 @@ object UIDTNotificationManager {
 
         RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Summary progress: downloaded=$totalBytesDownloaded, total=$totalBytesTotal, progress=$progress%, indeterminate=$indeterminate")
 
-        // Build progress text
-        val text = if (hasKnownTotal && totalBytesTotal > 0) {
-            "$progress% - $groupDownloads file${if (groupDownloads != 1) "s" else ""}"
-        } else {
-            config.getText("groupText", "count" to groupDownloads)
-        }
+        // Both the known-total and unknown-total cases go through the configured
+        // template. Hardcoding the former left `groupText` showing only in the instant
+        // before the first Content-Length arrived, so the string users actually read
+        // was untranslatable.
+        val text = config.getText(
+            "groupText",
+            "count" to groupDownloads,
+            "progress" to progress,
+        )
 
         // Create a standalone progress notification (NOT part of the group)
         // This ensures progress bar is visible in collapsed view
@@ -489,6 +514,29 @@ object UIDTNotificationManager {
             .setShowWhen(false)
             .setProgress(100, progress, indeterminate)
             .build()
+
+        // When the jobs share a notification id, that one notification is all the user
+        // sees, so the aggregate progress goes onto it through the job rather than
+        // beside it. A standalone notify() here would be a duplicate entry in the
+        // shade, and a hidden group summary would have nothing left to collapse.
+        val service = UIDTJobRegistry.serviceInstance
+        val liveParams = groupJobs.firstOrNull()?.value?.params
+
+        if (sharesGroupNotification(groupId) && service != null && liveParams != null) {
+            // The job it rides on can finish between the lookup and the call, and the
+            // platform refuses a notification for a job that is no longer running.
+            try {
+                service.setNotification(
+                    liveParams,
+                    getNotificationIdForGroup(groupId),
+                    progressNotification,
+                    JobService.JOB_END_NOTIFICATION_POLICY_DETACH
+                )
+            } catch (error: Exception) {
+                RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Shared notification update refused: ${error.message}")
+            }
+            return
+        }
 
         notificationManager.notify(summaryNotificationId, progressNotification)
 
