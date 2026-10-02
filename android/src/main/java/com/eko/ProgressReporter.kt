@@ -3,7 +3,7 @@ package com.eko
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.WritableArray
 import com.facebook.react.bridge.WritableMap
-import java.util.Date
+import android.os.SystemClock
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -35,13 +35,14 @@ class ProgressReporter(
     // Batching configuration
     private var progressInterval: Long = 0
     private var progressMinBytes: Long = 0
-    private var lastProgressReportedAt = Date()
+    private var lastProgressReportedAt = SystemClock.elapsedRealtime()
 
     /**
      * Configure the progress reporting thresholds.
      * @param interval Minimum milliseconds between batch emissions (0 = no time batching)
      * @param minBytes Minimum bytes change to trigger progress update (0 = use percentage only)
      */
+    @Synchronized
     fun configure(interval: Long, minBytes: Long) {
         progressInterval = interval
         progressMinBytes = minBytes
@@ -50,11 +51,13 @@ class ProgressReporter(
     /**
      * Get the current progress interval setting.
      */
+    @Synchronized
     fun getProgressInterval(): Long = progressInterval
 
     /**
      * Get the current minimum bytes setting.
      */
+    @Synchronized
     fun getProgressMinBytes(): Long = progressMinBytes
 
     /**
@@ -68,65 +71,53 @@ class ProgressReporter(
      * @param bytesTotal Total bytes to download (-1 if unknown)
      */
     fun reportProgress(configId: String, bytesDownloaded: Long, bytesTotal: Long) {
-        val prevPercent = configIdToPercent[configId] ?: 0.0
-        val prevBytes = configIdToLastBytes[configId] ?: 0L
+        val reports = synchronized(this) {
+            val prevPercent = configIdToPercent[configId] ?: 0.0
+            val prevBytes = configIdToLastBytes[configId] ?: 0L
 
-        // For unknown total (-1), use 0 for percent calculation
-        val effectiveTotal = if (bytesTotal > 0) bytesTotal else 0L
-        val percent = if (effectiveTotal > 0) bytesDownloaded.toDouble() / effectiveTotal else 0.0
+            // For unknown total (-1), use 0 for percent calculation
+            val effectiveTotal = if (bytesTotal > 0) bytesTotal else 0L
+            val percent = if (effectiveTotal > 0) bytesDownloaded.toDouble() / effectiveTotal else 0.0
 
-        // Check if we should report progress based on percentage OR bytes threshold
-        val percentThresholdMet = effectiveTotal > 0 &&
-            (percent - prevPercent > DownloadConstants.PROGRESS_REPORT_THRESHOLD)
+            // Check if we should report progress based on percentage OR bytes threshold
+            val percentThresholdMet = effectiveTotal > 0 &&
+                (percent - prevPercent > DownloadConstants.PROGRESS_REPORT_THRESHOLD)
 
-        // Only check bytes threshold if progressMinBytes > 0
-        val bytesThresholdMet = progressMinBytes > 0 &&
-            (bytesDownloaded - prevBytes >= progressMinBytes)
+            // Only check bytes threshold if progressMinBytes > 0
+            val bytesThresholdMet = progressMinBytes > 0 &&
+                (bytesDownloaded - prevBytes >= progressMinBytes)
 
-        // Report progress if either threshold is met, or if total bytes unknown (for realtime streams)
-        // bytesTotal <= 0 means unknown size (-1) or zero
-        if (percentThresholdMet || bytesThresholdMet || bytesTotal <= 0) {
-            val params = Arguments.createMap()
-            params.putString("id", configId)
-            params.putDouble(bytesFieldName, bytesDownloaded.toDouble())
-            params.putDouble("bytesTotal", bytesTotal.toDouble())
-            progressReports[configId] = params
-            configIdToPercent[configId] = percent
-            configIdToLastBytes[configId] = bytesDownloaded
+            // Report progress if either threshold is met, or if total bytes unknown (for realtime streams)
+            // bytesTotal <= 0 means unknown size (-1) or zero
+            if (percentThresholdMet || bytesThresholdMet || bytesTotal <= 0) {
+                val params = Arguments.createMap()
+                params.putString("id", configId)
+                params.putDouble(bytesFieldName, bytesDownloaded.toDouble())
+                params.putDouble("bytesTotal", bytesTotal.toDouble())
+                progressReports[configId] = params
+                configIdToPercent[configId] = percent
+                configIdToLastBytes[configId] = bytesDownloaded
+            }
+
+            takeBatchedReportsIfNeeded()
         }
-
-        // Check if it's time to emit batched reports
-        emitBatchedReportsIfNeeded()
+        // The batch has been removed and its interval reserved. New progress can
+        // accumulate while the bridge handles this emission without being cleared.
+        reports?.let(onEmitProgress)
     }
 
-    /**
-     * Check if the time interval has passed and emit any pending reports.
-     */
-    private fun emitBatchedReportsIfNeeded() {
-        val now = Date()
-        val isReportTimeDifference = now.time - lastProgressReportedAt.time > progressInterval
-        val isReportNotEmpty = progressReports.isNotEmpty()
+    /** Called with the reporting state locked. */
+    private fun takeBatchedReportsIfNeeded(): WritableArray? {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastProgressReportedAt < progressInterval || progressReports.isEmpty()) return null
 
-        if (isReportTimeDifference && isReportNotEmpty) {
-            emitBatchedReports()
-            lastProgressReportedAt = now
-        }
-    }
-
-    /**
-     * Emit all batched progress reports to JS.
-     */
-    private fun emitBatchedReports() {
-        // Create a copy to avoid concurrent modification
-        val reportsList = progressReports.values.toList()
         val reportsArray = Arguments.createArray()
-
-        for (report in reportsList) {
+        for (report in progressReports.values) {
             reportsArray.pushMap(report.copy())
         }
-
-        onEmitProgress(reportsArray)
         progressReports.clear()
+        lastProgressReportedAt = now
+        return reportsArray
     }
 
     /**
@@ -135,6 +126,7 @@ class ProgressReporter(
      *
      * @param configId The download identifier to clean up
      */
+    @Synchronized
     fun clearDownloadState(configId: String) {
         configIdToPercent.remove(configId)
         configIdToLastBytes.remove(configId)
@@ -147,6 +139,7 @@ class ProgressReporter(
      *
      * @param configId The download identifier
      */
+    @Synchronized
     fun clearPendingReport(configId: String) {
         progressReports.remove(configId)
     }
@@ -154,6 +147,7 @@ class ProgressReporter(
     /**
      * Set the percent tracking for a download (for restoring state).
      */
+    @Synchronized
     fun setPercent(configId: String, percent: Double) {
         configIdToPercent[configId] = percent
     }
@@ -161,6 +155,7 @@ class ProgressReporter(
     /**
      * Initialize tracking for a new download.
      */
+    @Synchronized
     fun initializeDownload(configId: String) {
         configIdToPercent[configId] = 0.0
         configIdToLastBytes[configId] = 0L
