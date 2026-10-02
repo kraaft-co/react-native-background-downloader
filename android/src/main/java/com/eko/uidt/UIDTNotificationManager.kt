@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
@@ -25,6 +27,9 @@ import java.net.URLConnection
  */
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 object UIDTNotificationManager {
+
+    private val progressHandler = Handler(Looper.getMainLooper())
+    private val pendingProgress = mutableMapOf<String, Runnable>()
 
     private val config: NotificationConfig
         get() = UIDTJobRegistry.notificationConfig
@@ -544,6 +549,24 @@ object UIDTNotificationManager {
     fun updateSummaryNotificationWithProgress(context: Context, groupId: String, groupName: String) {
         if (!config.groupingEnabled || groupId.isEmpty() || !config.showNotificationsEnabled) return
         if (config.mode != NotificationGroupingMode.SUMMARY_ONLY) return
+        // File starts, progress callbacks and completions can arrive in a burst.
+        // Android drops updates above its package rate limit, leaving an old bar.
+        // Read the latest tally when the scheduled update runs instead of queuing
+        // a notification for every event.
+        synchronized(pendingProgress) {
+            if (pendingProgress.containsKey(groupId)) return
+            val update = Runnable {
+                synchronized(pendingProgress) { pendingProgress.remove(groupId) }
+                postSummaryNotificationWithProgress(context.applicationContext, groupId, groupName)
+            }
+            pendingProgress[groupId] = update
+            progressHandler.postDelayed(update, config.updateInterval.coerceAtLeast(500L))
+        }
+    }
+
+    private fun postSummaryNotificationWithProgress(context: Context, groupId: String, groupName: String) {
+        if (!config.groupingEnabled || groupId.isEmpty() || !config.showNotificationsEnabled) return
+        if (config.mode != NotificationGroupingMode.SUMMARY_ONLY) return
         // Skip if group is finalized (all downloads complete) to prevent race conditions
         if (UIDTJobRegistry.isGroupFinalized(groupId)) {
             RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Skipping summary progress update for finalized group: $groupId")
@@ -690,6 +713,9 @@ object UIDTNotificationManager {
      */
     fun cancelSummaryNotification(context: Context, groupId: String) {
         if (groupId.isEmpty()) return
+        synchronized(pendingProgress) {
+            pendingProgress.remove(groupId)?.let(progressHandler::removeCallbacks)
+        }
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val summaryNotificationId = UIDTConstants.SUMMARY_NOTIFICATION_ID + groupId.hashCode()
 
