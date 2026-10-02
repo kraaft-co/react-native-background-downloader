@@ -15,6 +15,7 @@ import com.eko.RNBackgroundDownloaderModuleImpl
 import com.eko.ResumableDownloader
 import com.eko.UIDTDownloadJobService
 import com.eko.utils.ProgressUtils
+import org.json.JSONObject
 
 /**
  * Manages UIDT job scheduling, cancellation, pause and resume operations.
@@ -312,6 +313,7 @@ object UIDTJobManager {
         val success = result == JobScheduler.RESULT_SUCCESS
 
         if (success) {
+            UIDTJobRegistry.registerGroupFile(groupIdOf(metadata), configId, totalBytes)
             RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Scheduled UIDT job for $configId (jobId=$jobId, isAllowedOverMetered=$isAllowedOverMetered)")
         } else {
             RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to schedule UIDT job for $configId")
@@ -322,6 +324,13 @@ object UIDTJobManager {
         }
 
         return success
+    }
+
+    /** The group a download belongs to, read from the metadata the caller passed. */
+    private fun groupIdOf(metadata: String): String = try {
+        JSONObject(metadata).optString("groupId", "")
+    } catch (e: Exception) {
+        ""
     }
 
     /**

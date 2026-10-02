@@ -207,6 +207,10 @@ class UIDTDownloadJobService : JobService() {
             RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to parse metadata: ${e.message}")
         }
 
+        // Re-enrol in the group: the tally lives in memory, so a job the system
+        // restarts after process death finds none.
+        UIDTJobRegistry.registerGroupFile(groupId, configId, totalBytes)
+
         // Resolve headers and start byte.
         // In-memory pendingHeaders is populated in the same process (scheduleDownload / onStopJob).
         // The disk-persisted resume state is the fallback for a fresh process after a restart.
@@ -453,13 +457,16 @@ class UIDTDownloadJobService : JobService() {
 
                 // Clean up - remove from activeJobs first
                 UIDTJobRegistry.activeJobs.remove(id)
+                UIDTJobRegistry.markFileCompleted(groupId, id)
                 releaseWakeLock()
 
-                // Check if this was the last job in the group
-                val remainingInGroup = UIDTJobRegistry.activeJobs.values.count { it.groupId == groupId }
-                RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Jobs remaining in group '$groupId': $remainingInGroup, activeJobs count=${UIDTJobRegistry.activeJobs.size}")
+                // The group is over when every file it enrolled is done, not when no
+                // job is live: files whose job has not started yet hold no live job.
+                val groupIsOver = groupId.isNotEmpty() && UIDTJobRegistry.isGroupComplete(groupId)
+                val remainingInGroup = UIDTJobRegistry.groupProgress[groupId]?.pendingFiles ?: 0
+                RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Files left in group '$groupId': $remainingInGroup, activeJobs count=${UIDTJobRegistry.activeJobs.size}")
 
-                if (remainingInGroup == 0 && groupId.isNotEmpty()) {
+                if (groupIsOver) {
                     RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Last job in group completed. Marking finalized and cancelling summary.")
                     // Mark group as finalized FIRST to prevent race conditions
                     // where delayed progress callbacks might recreate the notification
@@ -506,13 +513,16 @@ class UIDTDownloadJobService : JobService() {
 
                 // Clean up - remove from activeJobs first
                 UIDTJobRegistry.activeJobs.remove(id)
+                // A failed file never reaches 100%, so drop it instead of letting it
+                // hold the group's progress short of complete for good.
+                UIDTJobRegistry.forgetGroupFile(groupId, id)
                 releaseWakeLock()
 
-                // Check if this was the last job in the group
-                val remainingInGroup = UIDTJobRegistry.activeJobs.values.count { it.groupId == groupId }
-                RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Jobs remaining in group '$groupId' after error: $remainingInGroup")
+                val groupIsOver = groupId.isNotEmpty() && UIDTJobRegistry.isGroupComplete(groupId)
+                val remainingInGroup = UIDTJobRegistry.groupProgress[groupId]?.pendingFiles ?: 0
+                RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Files left in group '$groupId' after error: $remainingInGroup")
 
-                if (remainingInGroup == 0 && groupId.isNotEmpty()) {
+                if (groupIsOver) {
                     // Mark group as finalized FIRST to prevent race conditions
                     UIDTJobRegistry.markGroupFinalized(groupId)
                     // Last job in group - cancel summary notification

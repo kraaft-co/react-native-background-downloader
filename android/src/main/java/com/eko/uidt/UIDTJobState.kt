@@ -74,17 +74,65 @@ data class NotificationConfig(
     }
 }
 
+/** Byte counts of one download inside a group. */
+class FileProgress {
+    @Volatile var bytesDownloaded: Long = 0L
+    @Volatile var bytesTotal: Long = -1L
+    @Volatile var completed: Boolean = false
+}
+
 /**
- * Tracks aggregate progress for a download group.
+ * Aggregate progress of a download group. A file is registered when its job is
+ * scheduled and stays in the map once it finishes, so neither the numerator nor
+ * the denominator shrinks mid-batch - summing the live jobs instead made the
+ * percentage fall back every time a file completed.
  */
-data class GroupProgress(
-    var totalFiles: Int = 0,
-    var completedFiles: Int = 0,
-    var totalBytes: Long = 0L,
-    var downloadedBytes: Long = 0L
-) {
+class GroupProgress {
+    private val files = ConcurrentHashMap<String, FileProgress>()
+
+    fun register(configId: String, bytesTotal: Long) {
+        val file = files.getOrPut(configId) { FileProgress() }
+        if (bytesTotal > 0) file.bytesTotal = bytesTotal
+    }
+
+    fun update(configId: String, bytesDownloaded: Long, bytesTotal: Long) {
+        val file = files.getOrPut(configId) { FileProgress() }
+        file.bytesDownloaded = bytesDownloaded
+        if (bytesTotal > 0) file.bytesTotal = bytesTotal
+    }
+
+    fun markCompleted(configId: String) {
+        val file = files.getOrPut(configId) { FileProgress() }
+        file.completed = true
+        if (file.bytesTotal > 0) file.bytesDownloaded = file.bytesTotal
+    }
+
+    /** Drops a download that will never finish, so it stops holding the group open. */
+    fun forget(configId: String) {
+        files.remove(configId)
+    }
+
+    val isEmpty: Boolean get() = files.isEmpty()
+    val totalFiles: Int get() = files.size
+    val completedFiles: Int get() = files.values.count { it.completed }
+    val pendingFiles: Int get() = totalFiles - completedFiles
+    val allCompleted: Boolean get() = files.isNotEmpty() && completedFiles == totalFiles
+    val downloadedBytes: Long get() = files.values.sumOf { it.bytesDownloaded }
+    val totalBytes: Long get() = files.values.sumOf { if (it.bytesTotal > 0) it.bytesTotal else 0L }
+
+    /**
+     * Only every known size makes the bar honest: with one size still missing the
+     * denominator is short, and the bar would jump backwards when it arrives.
+     * Passing `totalBytes` to the download avoids the indeterminate phase.
+     */
+    val hasKnownTotal: Boolean get() = files.isNotEmpty() && files.values.all { it.bytesTotal > 0 }
+
     val progressPercent: Int
-        get() = if (totalBytes > 0) ((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
+        get() = if (hasKnownTotal && totalBytes > 0) {
+            ((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 100)
+        } else {
+            0
+        }
 }
 
 /**
@@ -259,38 +307,50 @@ object UIDTJobRegistry {
     }
 
     /**
+     * Enrol a download in its group as soon as its job is scheduled, so a file
+     * that has not started yet already counts towards the group's total.
+     */
+    fun registerGroupFile(groupId: String, configId: String, bytesTotal: Long) {
+        if (groupId.isEmpty()) return
+        groupProgress.getOrPut(groupId) { GroupProgress() }.register(configId, bytesTotal)
+    }
+
+    /**
      * Update aggregate progress for a group.
      */
     fun updateGroupProgress(groupId: String, configId: String, bytesDownloaded: Long, bytesTotal: Long) {
         if (groupId.isEmpty()) return
-
-        val progress = groupProgress.getOrPut(groupId) { GroupProgress() }
-        // We track per-file progress by summing from all active jobs in the group
-        var totalDownloaded = 0L
-        var totalTotal = 0L
-        var fileCount = 0
-
-        activeJobs.values.filter { it.groupId == groupId }.forEach { job ->
-            val state = job.resumableDownloader.getState(activeJobs.entries.find { it.value == job }?.key ?: return@forEach)
-            totalDownloaded += state?.bytesDownloaded?.get() ?: 0L
-            if (state?.bytesTotal ?: -1L > 0) {
-                totalTotal += state?.bytesTotal ?: 0L
-            }
-            fileCount++
-        }
-
-        progress.downloadedBytes = totalDownloaded
-        progress.totalBytes = totalTotal
-        progress.totalFiles = fileCount
+        groupProgress.getOrPut(groupId) { GroupProgress() }.update(configId, bytesDownloaded, bytesTotal)
     }
 
     /**
      * Mark a file as completed in a group.
      */
-    fun markFileCompleted(groupId: String) {
+    fun markFileCompleted(groupId: String, configId: String) {
         if (groupId.isEmpty()) return
-        val progress = groupProgress[groupId] ?: return
-        progress.completedFiles++
+        // No tally means the group is already over; don't resurrect it.
+        groupProgress[groupId]?.markCompleted(configId)
+    }
+
+    /**
+     * Drop a download that will never finish (cancelled, or failed for good) from
+     * its group, so the remaining files can still reach 100%.
+     */
+    fun forgetGroupFile(groupId: String, configId: String) {
+        if (groupId.isEmpty()) return
+        groupProgress[groupId]?.forget(configId)
+    }
+
+    /**
+     * Whether every download enrolled in the group has finished. Unlike counting
+     * the live jobs, this also waits for the ones whose job has not started yet.
+     */
+    fun isGroupComplete(groupId: String): Boolean {
+        if (groupId.isEmpty()) return false
+        // A group with nothing left in it is over too - every file failed and was
+        // forgotten, or the tally was already cleared.
+        val progress = groupProgress[groupId] ?: return true
+        return progress.isEmpty || progress.allCompleted
     }
 
     /**

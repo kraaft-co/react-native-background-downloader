@@ -244,7 +244,7 @@ object UIDTNotificationManager {
         // In summaryOnly mode, skip updating individual notifications - only update summary
         if (isSummaryOnlyMode && config.groupingEnabled && jobState.groupId.isNotEmpty()) {
             // Update group progress tracking
-            UIDTJobRegistry.updateGroupProgress(jobState.groupId, "", bytesDownloaded, bytesTotal)
+            UIDTJobRegistry.updateGroupProgress(jobState.groupId, configId, bytesDownloaded, bytesTotal)
             // Update the summary notification with aggregate progress
             updateSummaryNotificationWithProgress(context, jobState.groupId, jobState.groupName)
             return
@@ -405,12 +405,12 @@ object UIDTNotificationManager {
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-        // Count active downloads for this specific group
-        val groupDownloads = UIDTJobRegistry.activeJobs.values.count { it.groupId == groupId }
+        val tally = UIDTJobRegistry.groupProgress[groupId]
+        val groupDownloads = tally?.pendingFiles ?: 0
         val summaryNotificationId = UIDTConstants.SUMMARY_NOTIFICATION_ID + groupId.hashCode()
 
         if (groupDownloads == 0) {
-            // Remove summary for this group when no active downloads
+            // Remove summary for this group when nothing is left to download
             notificationManager.cancel(summaryNotificationId)
             UIDTJobRegistry.clearGroupProgress(groupId)
             return
@@ -418,7 +418,11 @@ object UIDTNotificationManager {
 
         val groupKey = "${UIDTConstants.NOTIFICATION_GROUP_KEY}_$groupId"
         val title = groupName.ifEmpty { config.getText("groupTitle") }
-        val text = config.getText("groupText", "count" to groupDownloads)
+        val text = config.getText(
+            "groupText",
+            "count" to groupDownloads,
+            "progress" to (tally?.progressPercent ?: 0),
+        )
 
         val summaryNotification = NotificationCompat.Builder(context, UIDTConstants.NOTIFICATION_CHANNEL_ID)
             .setContentTitle(title)
@@ -449,47 +453,29 @@ object UIDTNotificationManager {
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-        // Get all active jobs for this group and calculate aggregate progress
-        val groupJobs = UIDTJobRegistry.activeJobs.entries.filter { it.value.groupId == groupId }
-        val groupDownloads = groupJobs.size
+        // The group's own tally, which keeps finished files and files whose job has
+        // not started. Summing the live jobs instead made the bar fall back on every
+        // completion and reach 100% while files were still queued.
+        val tally = UIDTJobRegistry.groupProgress[groupId]
         val summaryNotificationId = UIDTConstants.SUMMARY_NOTIFICATION_ID + groupId.hashCode()
 
-        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "updateSummaryNotificationWithProgress: groupId=$groupId, groupDownloads=$groupDownloads")
-
-        if (groupDownloads == 0) {
-            // Remove summary for this group when no active downloads
+        if (tally == null || tally.isEmpty) {
             RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Cancelling summary notification $summaryNotificationId for empty group $groupId")
             notificationManager.cancel(summaryNotificationId)
             UIDTJobRegistry.clearGroupProgress(groupId)
             return
         }
 
-        // Calculate aggregate progress from all active jobs in the group
-        var totalBytesDownloaded = 0L
-        var totalBytesTotal = 0L
-        var hasKnownTotal = false
-
-        for ((_, jobState) in groupJobs) {
-            // Use JobState's tracked progress (updated on every progress callback)
-            totalBytesDownloaded += jobState.bytesDownloaded
-            if (jobState.bytesTotal > 0) {
-                totalBytesTotal += jobState.bytesTotal
-                hasKnownTotal = true
-            }
-        }
+        val groupDownloads = tally.pendingFiles
+        val totalBytesDownloaded = tally.downloadedBytes
+        val totalBytesTotal = tally.totalBytes
+        val progress = tally.progressPercent
+        val indeterminate = !tally.hasKnownTotal
 
         val groupKey = "${UIDTConstants.NOTIFICATION_GROUP_KEY}_$groupId"
         val title = groupName.ifEmpty { config.getText("groupTitle") }
 
-        // Calculate progress percentage
-        val progress = if (hasKnownTotal && totalBytesTotal > 0) {
-            ((totalBytesDownloaded * 100) / totalBytesTotal).toInt().coerceIn(0, 100)
-        } else {
-            0
-        }
-        val indeterminate = !hasKnownTotal || totalBytesTotal <= 0
-
-        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Summary progress: downloaded=$totalBytesDownloaded, total=$totalBytesTotal, progress=$progress%, indeterminate=$indeterminate")
+        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Summary progress: group=$groupId, files=${tally.completedFiles}/${tally.totalFiles}, downloaded=$totalBytesDownloaded, total=$totalBytesTotal, progress=$progress%, indeterminate=$indeterminate")
 
         // Both the known-total and unknown-total cases go through the configured
         // template. Hardcoding the former left `groupText` showing only in the instant
@@ -520,7 +506,11 @@ object UIDTNotificationManager {
         // beside it. A standalone notify() here would be a duplicate entry in the
         // shade, and a hidden group summary would have nothing left to collapse.
         val service = UIDTJobRegistry.serviceInstance
-        val liveParams = groupJobs.firstOrNull()?.value?.params
+        // The tally has no JobParameters, so the carrier job still comes from the
+        // live ones - any of the group's will do.
+        val liveParams = UIDTJobRegistry.activeJobs.values
+            .firstOrNull { it.groupId == groupId }
+            ?.params
 
         if (sharesGroupNotification(groupId) && service != null && liveParams != null) {
             // The job it rides on can finish between the lookup and the call, and the
