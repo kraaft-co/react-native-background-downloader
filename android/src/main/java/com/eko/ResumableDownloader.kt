@@ -535,13 +535,22 @@ class ResumableDownloader {
           // Range Not Satisfiable - file might be complete or server doesn't support ranges
           RNBackgroundDownloaderModuleImpl.logW(TAG, "Range not satisfiable for ${state.id}, checking if complete")
 
-          // The download might already be complete
+          // Recovery can lose the known total even after every byte was written.
+          // A 416 response describes the current resource size as bytes */N.
+          val contentRange = connection.getHeaderField("Content-Range")
+          val completeLength = if (contentRange != null) {
+            Regex("""bytes \*/(\d+)""", RegexOption.IGNORE_CASE)
+              .matchEntire(contentRange.trim())?.groupValues?.get(1)?.toLongOrNull()
+          } else {
+            state.bytesTotal.takeIf { it > 0 }
+          }
           val destFile = File(state.destination)
-          if (destFile.exists() && state.bytesTotal > 0 && destFile.length() >= state.bytesTotal) {
-            // File is complete
+          if (completeLength != null && completeLength > 0 && startByte == completeLength &&
+              destFile.isFile && destFile.length() == completeLength) {
+            state.bytesTotal = completeLength
             activeDownloads.remove(state.id)
-            listener.onComplete(state.id, state.destination, state.bytesTotal, state.bytesTotal)
-            return DownloadResult.Success(state.id, state.destination, state.bytesTotal, state.bytesTotal)
+            listener.onComplete(state.id, state.destination, completeLength, completeLength)
+            return DownloadResult.Success(state.id, state.destination, completeLength, completeLength)
           }
 
           val error = DownloadResult.httpError(state.id, responseCode, "Range not satisfiable")
