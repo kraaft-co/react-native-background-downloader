@@ -4,6 +4,8 @@ import android.app.DownloadManager
 import android.app.NotificationManager
 import android.app.job.JobInfo
 import android.app.job.JobScheduler
+import android.app.job.JobWorkItem
+import android.content.Intent
 import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
@@ -102,7 +104,8 @@ object UIDTJobManager {
         if (!isUIDTAvailable()) return emptyList()
 
         val jobScheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-        return pendingJobs(jobScheduler).orEmpty().mapNotNull { job ->
+        val pending = pendingJobs(jobScheduler)
+        return queuedBatchItems(context, pending) + pending.orEmpty().mapNotNull { job ->
             val configId = UIDTJobIds.configIdOf(job) ?: return@mapNotNull null
             if (UIDTJobRegistry.isActiveJob(configId)) return@mapNotNull null
 
@@ -236,6 +239,19 @@ object UIDTJobManager {
             return false
         }
 
+        // A grouped download joins its batch's single job instead of taking a slot
+        // of its own. Falls through to a per-download job when that is refused -
+        // notably while the app is not visible, which the platform requires for
+        // enqueueing user-initiated work.
+        if (wantsBatching(metadata)) {
+            val groupId = groupIdOf(metadata)
+            if (enqueueIntoBatch(context, jobScheduler, pendingJobs, groupId, configId, url, destination, headers, startByte, totalBytes, metadata, isAllowedOverMetered)) {
+                UIDTJobIds.endReservation(configId)
+                UIDTJobRegistry.registerGroupFile(groupId, configId, totalBytes)
+                return true
+            }
+        }
+
         try {
             return scheduleJob(context, jobScheduler, jobId, configId, url, destination, headers, startByte, totalBytes, metadata, isAllowedOverMetered)
         } finally {
@@ -326,11 +342,158 @@ object UIDTJobManager {
         return success
     }
 
+    /**
+     * The downloads still queued behind a batch job. They have no job of their own
+     * to read, so they come from what [enqueueIntoBatch] recorded - kept only while
+     * their batch job is alive, so a record left by a reboot is dropped rather than
+     * reported as pending forever.
+     */
+    private fun queuedBatchItems(context: Context, pendingJobs: List<JobInfo>?): List<UIDTJobInfo> {
+        val liveBatches = pendingJobs.orEmpty().mapNotNull { UIDTJobIds.batchKeyOf(it) }.toSet()
+
+        return UIDTJobRegistry.loadBatchItems(context).mapNotNull { (configId, item) ->
+            if (UIDTJobRegistry.isActiveJob(configId)) return@mapNotNull null
+
+            val key = item.optString("groupId") to item.optBoolean("metered", true)
+            if (key !in liveBatches) {
+                UIDTJobRegistry.clearBatchItem(context, configId)
+                return@mapNotNull null
+            }
+
+            UIDTJobInfo(
+                id = configId,
+                status = DownloadManager.STATUS_PENDING,
+                bytesDownloaded = UIDTJobRegistry.loadResumeState(context, configId)?.second ?: 0L,
+                bytesTotal = item.optLong("totalBytes", -1),
+                url = item.optString("url"),
+                destination = item.optString("destination"),
+                metadata = item.optString("metadata", "{}"),
+            )
+        }
+    }
+
+    /** A batch job's size estimate is fixed, so every enqueue passes the same JobInfo. */
+    private const val BATCH_ESTIMATED_BYTES = 500L * 1024 * 1024
+
+    /**
+     * Whether this download belongs to a batch. Only summaryOnly grouping asks for
+     * one notification covering the group, which is what a single job gives; the
+     * other modes want a notification per download, and the platform ties one
+     * notification to one job.
+     */
+    private fun wantsBatching(metadata: String): Boolean {
+        val config = UIDTJobRegistry.notificationConfig
+        return groupIdOf(metadata).isNotEmpty() &&
+            config.groupingEnabled &&
+            config.mode == NotificationGroupingMode.SUMMARY_ONLY
+    }
+
+    /**
+     * Add this download to its batch's job as a work item, creating the job on the
+     * first one. Returns false when the platform refuses, leaving the caller to
+     * schedule a job for this download alone.
+     */
+    private fun enqueueIntoBatch(
+        context: Context,
+        jobScheduler: JobScheduler,
+        pendingJobs: List<JobInfo>?,
+        groupId: String,
+        configId: String,
+        url: String,
+        destination: String,
+        headers: Map<String, String>,
+        startByte: Long,
+        totalBytes: Long,
+        metadata: String,
+        isAllowedOverMetered: Boolean,
+    ): Boolean {
+        val jobId = UIDTJobIds.batchJobIdFor(groupId, isAllowedOverMetered, pendingJobs) ?: return false
+
+        UIDTJobRegistry.pendingHeaders[configId] = headers
+        UIDTJobRegistry.saveResumeState(context, configId, headers, startByte)
+        UIDTJobRegistry.saveBatchItem(context, configId, url, destination, totalBytes, metadata, groupId, isAllowedOverMetered)
+
+        val work = JobWorkItem.Builder()
+            .setIntent(
+                Intent().apply {
+                    putExtra(UIDTConstants.KEY_DOWNLOAD_ID, configId)
+                    putExtra(UIDTConstants.KEY_URL, url)
+                    putExtra(UIDTConstants.KEY_DESTINATION, destination)
+                    putExtra(UIDTConstants.KEY_START_BYTE, startByte)
+                    putExtra(UIDTConstants.KEY_TOTAL_BYTES, totalBytes)
+                    putExtra(UIDTConstants.KEY_METADATA, metadata)
+                    putExtra(UIDTConstants.KEY_IS_ALLOWED_OVER_METERED, isAllowedOverMetered)
+                }
+            )
+            .setEstimatedNetworkBytes(
+                if (totalBytes > 0) totalBytes else JobInfo.NETWORK_BYTES_UNKNOWN.toLong(),
+                0,
+            )
+            .build()
+
+        val result = try {
+            jobScheduler.enqueue(batchJobInfo(context, jobId, groupId, isAllowedOverMetered), work)
+        } catch (e: RuntimeException) {
+            RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "Batch enqueue refused for $configId in '$groupId': ${e.message}")
+            JobScheduler.RESULT_FAILURE
+        }
+
+        if (result != JobScheduler.RESULT_SUCCESS) {
+            RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "Batch enqueue failed for $configId, falling back to its own job")
+            UIDTJobIds.releaseBatch(groupId, isAllowedOverMetered)
+            UIDTJobRegistry.clearBatchItem(context, configId)
+            return false
+        }
+
+        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Enqueued $configId into batch job $jobId for group '$groupId' (isAllowedOverMetered=$isAllowedOverMetered)")
+        return true
+    }
+
+    /**
+     * The batch's JobInfo, built identically on every enqueue so adding work never
+     * looks like a different job to the system.
+     */
+    private fun batchJobInfo(context: Context, jobId: Int, groupId: String, isAllowedOverMetered: Boolean): JobInfo {
+        val extras = PersistableBundle().apply {
+            putInt(UIDTConstants.KEY_IS_BATCH, 1)
+            putString(UIDTConstants.KEY_GROUP_ID, groupId)
+            putInt(UIDTConstants.KEY_IS_ALLOWED_OVER_METERED, if (isAllowedOverMetered) 1 else 0)
+        }
+
+        return JobInfo.Builder(jobId, ComponentName(context, UIDTDownloadJobService::class.java))
+            .setUserInitiated(true)
+            .setRequiredNetwork(NetworkRequestUtils.internetRequest(requireUnmetered = !isAllowedOverMetered))
+            .setExtras(extras)
+            .setEstimatedNetworkBytes(BATCH_ESTIMATED_BYTES, 0)
+            .build()
+    }
+
     /** The group a download belongs to, read from the metadata the caller passed. */
     private fun groupIdOf(metadata: String): String = try {
         JSONObject(metadata).optString("groupId", "")
     } catch (e: Exception) {
         ""
+    }
+
+    /**
+     * Cancel one download of a batch. The job and its notification belong to the
+     * whole group, so neither is touched; the work item is retired by hand because
+     * a cancelled download reports to no listener.
+     */
+    private fun cancelBatchItem(context: Context, configId: String, jobState: JobState): Boolean {
+        jobState.resumableDownloader.cancel(configId)
+
+        UIDTJobRegistry.activeJobs.remove(configId)
+        UIDTJobRegistry.forgetGroupFile(jobState.groupId, configId)
+        UIDTJobRegistry.pendingHeaders.remove(configId)
+        UIDTJobRegistry.clearResumeState(context, configId)
+        UIDTJobRegistry.clearBatchItem(context, configId)
+
+        jobState.workItem?.let { UIDTJobRegistry.serviceInstance?.completeBatchItem(jobState.params, it) }
+        UIDTNotificationManager.updateSummaryNotificationForGroup(context, jobState.groupId, jobState.groupName)
+
+        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Cancelled batch item $configId in group '${jobState.groupId}'")
+        return true
     }
 
     /**
@@ -348,6 +511,8 @@ object UIDTJobManager {
         // Get job state before removing (for notification cleanup)
         val jobState = UIDTJobRegistry.activeJobs[configId]
         RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "cancelJob: jobState=$jobState")
+
+        if (jobState?.workItem != null) return cancelBatchItem(context, configId, jobState)
 
         if (jobState != null) {
             // First cancel the download in the ResumableDownloader (stops the actual HTTP download)
@@ -377,7 +542,19 @@ object UIDTJobManager {
         }
 
         val jobScheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-        jobScheduler.cancel(UIDTJobIds.jobIdToCancel(configId, pendingJobs(jobScheduler)))
+        val pending = pendingJobs(jobScheduler)
+        if (jobState == null && pending != null && UIDTJobIds.jobIdFor(configId, pending) == null) {
+            // No job of its own: it is either gone, or still queued behind a batch
+            // job. A work item cannot be pulled out of the system's queue, so mark
+            // it and let the service skip it when its turn comes. Cancelling the
+            // legacy ID here would take down whichever job happens to hold it.
+            RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "No own job for $configId; marking it cancelled")
+            UIDTJobRegistry.markCancelled(configId)
+            UIDTJobRegistry.pendingHeaders.remove(configId)
+            UIDTJobRegistry.clearResumeState(context, configId)
+            return true
+        }
+        jobScheduler.cancel(UIDTJobIds.jobIdToCancel(configId, pending))
         UIDTJobRegistry.pendingHeaders.remove(configId)
         UIDTJobRegistry.activeJobs.remove(configId)
         // Clear persisted resume state so stale headers/bytes don't affect future downloads

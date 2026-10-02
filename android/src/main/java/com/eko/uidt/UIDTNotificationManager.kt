@@ -268,6 +268,34 @@ object UIDTNotificationManager {
     }
 
     /**
+     * The notification a batch job carries from the moment it starts, before any
+     * byte total is known. updateSummaryNotificationWithProgress then pushes the
+     * aggregate onto this same id through the job.
+     */
+    fun createBatchNotification(context: Context, groupId: String): Notification {
+        val channelId = if (config.showNotificationsEnabled) {
+            UIDTConstants.NOTIFICATION_CHANNEL_ID
+        } else {
+            UIDTConstants.NOTIFICATION_CHANNEL_SILENT_ID
+        }
+
+        val builder = NotificationCompat.Builder(context, channelId)
+            .setContentTitle(if (config.showNotificationsEnabled) config.getText("groupTitle") else "")
+            .setContentText(if (config.showNotificationsEnabled) config.getText("downloadStarting") else "")
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setPriority(if (config.showNotificationsEnabled) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_MIN)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setProgress(0, 0, true)
+
+        buildTapPendingIntent(context, groupTapUrl(groupId), getNotificationIdForGroup(groupId))
+            ?.let(builder::setContentIntent)
+
+        return builder.build()
+    }
+
+    /**
      * Update notification with download progress.
      */
     fun updateProgressNotification(

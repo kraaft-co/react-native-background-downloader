@@ -2,6 +2,7 @@ package com.eko
 
 import android.app.job.JobParameters
 import android.app.job.JobService
+import android.app.job.JobWorkItem
 import android.content.Context
 import android.os.Build
 import android.os.PowerManager
@@ -180,6 +181,8 @@ class UIDTDownloadJobService : JobService() {
     override fun onStartJob(params: JobParameters): Boolean {
         RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "onStartJob called")
 
+        if (params.extras.getInt(UIDTConstants.KEY_IS_BATCH, 0) == 1) return startBatchJob(params)
+
         val extras = params.extras
         val configId = extras.getString(UIDTConstants.KEY_DOWNLOAD_ID) ?: run {
             RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "No download ID in job extras")
@@ -313,6 +316,151 @@ class UIDTDownloadJobService : JobService() {
         return true
     }
 
+    /**
+     * Retire one item of a batch and move on to the next. Used when a download is
+     * cancelled, which the downloader reports to no listener.
+     */
+    fun completeBatchItem(params: JobParameters, item: JobWorkItem) {
+        try {
+            params.completeWork(item)
+        } catch (error: Exception) {
+            RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "completeWork refused for a cancelled item: ${error.message}")
+        }
+        val groupId = params.extras.getString(UIDTConstants.KEY_GROUP_ID) ?: return
+        pumpBatchWork(params, groupId, params.extras.getInt(UIDTConstants.KEY_IS_ALLOWED_OVER_METERED, 1) == 1)
+    }
+
+    /**
+     * Run a whole group off one job. The platform requires a user-initiated job to
+     * carry a notification, so one job per file meant one notification per file and
+     * N slots of the app's 150-job quota; a job with a queue of work items costs
+     * one of each, whatever the batch size.
+     */
+    private fun startBatchJob(params: JobParameters): Boolean {
+        val groupId = params.extras.getString(UIDTConstants.KEY_GROUP_ID) ?: run {
+            RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Batch job without a group id")
+            return false
+        }
+        val isAllowedOverMetered = params.extras.getInt(UIDTConstants.KEY_IS_ALLOWED_OVER_METERED, 1) == 1
+
+        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Batch job started for group '$groupId' (isAllowedOverMetered=$isAllowedOverMetered)")
+        UIDTJobRegistry.unmarkGroupFinalized(groupId)
+        acquireWakeLock()
+
+        setNotification(
+            params,
+            UIDTNotificationManager.getNotificationIdForGroup(groupId),
+            UIDTNotificationManager.createBatchNotification(this, groupId),
+            JOB_END_NOTIFICATION_POLICY_REMOVE,
+        )
+
+        pumpBatchWork(params, groupId, isAllowedOverMetered)
+        return true
+    }
+
+    /**
+     * Take every work item the system is holding and start it. Called again after
+     * each one finishes, which is what picks up downloads enqueued while the job
+     * was already running - those bring no second onStartJob.
+     */
+    private fun pumpBatchWork(params: JobParameters, groupId: String, isAllowedOverMetered: Boolean) {
+        while (true) {
+            val item = try {
+                params.dequeueWork()
+            } catch (error: Exception) {
+                RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "dequeueWork refused for group '$groupId': ${error.message}")
+                null
+            } ?: return
+
+            if (!startBatchWorkItem(params, item, groupId, isAllowedOverMetered)) {
+                try {
+                    params.completeWork(item)
+                } catch (error: Exception) {
+                    RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "completeWork refused while skipping an item: ${error.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Start the download one work item describes. Returns false when there is
+     * nothing to run - a malformed item, or one the app cancelled before its turn
+     * came - so the caller can retire it.
+     */
+    private fun startBatchWorkItem(
+        params: JobParameters,
+        item: JobWorkItem,
+        groupId: String,
+        isAllowedOverMetered: Boolean,
+    ): Boolean {
+        val intent = item.intent ?: return false
+        val configId = intent.getStringExtra(UIDTConstants.KEY_DOWNLOAD_ID) ?: return false
+        val url = intent.getStringExtra(UIDTConstants.KEY_URL) ?: return false
+        val destination = intent.getStringExtra(UIDTConstants.KEY_DESTINATION) ?: return false
+
+        if (UIDTJobRegistry.isCancelled(configId)) {
+            RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Skipping $configId: cancelled before its turn in group '$groupId'")
+            UIDTJobRegistry.forgetGroupFile(groupId, configId)
+            UIDTJobRegistry.clearCancelled(configId)
+            return false
+        }
+
+        val totalBytes = intent.getLongExtra(UIDTConstants.KEY_TOTAL_BYTES, -1)
+        val metadataJson = intent.getStringExtra(UIDTConstants.KEY_METADATA) ?: "{}"
+        var groupName = ""
+        var customTitle = ""
+        var tapUrl = ""
+        var groupTapUrl = ""
+        try {
+            val json = JSONObject(metadataJson)
+            groupName = json.optString("groupName", "")
+            customTitle = json.optString("notificationTitle", "")
+            tapUrl = json.optString("tapUrl", "")
+            groupTapUrl = json.optString("groupTapUrl", "")
+        } catch (error: Exception) {
+            RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to parse metadata of $configId: ${error.message}")
+        }
+
+        val persisted = UIDTJobRegistry.loadResumeState(this, configId)
+        val headers = persisted?.first ?: UIDTJobRegistry.pendingHeaders[configId] ?: emptyMap()
+        val startByte = persisted?.second ?: intent.getLongExtra(UIDTConstants.KEY_START_BYTE, 0)
+        UIDTJobRegistry.clearResumeState(this, configId)
+
+        UIDTJobRegistry.registerGroupFile(groupId, configId, totalBytes)
+
+        val resumableDownloader = ResumableDownloader()
+        // Every job of the batch shares one notification, which the group's own id
+        // owns - an item never posts or removes one of its own.
+        UIDTJobRegistry.activeJobs[configId] = JobState(
+            params,
+            resumableDownloader,
+            UIDTNotificationManager.getNotificationIdForGroup(groupId),
+            groupId,
+            groupName,
+            customTitle,
+            tapUrl,
+            groupTapUrl,
+            item,
+        )
+
+        UIDTNotificationManager.updateSummaryNotificationForGroup(this, groupId, groupName)
+
+        resumableDownloader.startDownload(
+            id = configId,
+            url = url,
+            destination = destination,
+            headers = headers,
+            listener = createJobListener(configId, params, groupId, groupName, customTitle, item, isAllowedOverMetered),
+            startByte = startByte,
+            totalBytes = totalBytes,
+            isAllowedOverMetered = isAllowedOverMetered,
+            network = params.network,
+        )
+
+        RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Started batch item $configId in group '$groupId' from byte $startByte")
+        return true
+    }
+
     override fun onStopJob(params: JobParameters): Boolean {
         val extras = params.extras
         val configId = extras.getString(UIDTConstants.KEY_DOWNLOAD_ID)
@@ -324,6 +472,18 @@ class UIDTDownloadJobService : JobService() {
         }
 
         RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "onStopJob called for $configId, reason: $stopReason")
+
+        // A batch job holds several downloads, and none of them is named in the job
+        // extras: pause every one it is running so each resumes where it stopped.
+        // Returning true hands the uncompleted work items back for the next run.
+        if (params.extras.getInt(UIDTConstants.KEY_IS_BATCH, 0) == 1) {
+            val groupId = params.extras.getString(UIDTConstants.KEY_GROUP_ID)
+            UIDTJobRegistry.activeJobs.entries
+                .filter { it.value.groupId == groupId }
+                .forEach { (id, jobState) -> pauseForReschedule(id, jobState) }
+            releaseWakeLock()
+            return true
+        }
 
         if (configId != null) {
             val jobState = UIDTJobRegistry.activeJobs[configId]
@@ -351,13 +511,42 @@ class UIDTDownloadJobService : JobService() {
         return true
     }
 
+    /** Save a download's position and drop it from the registry, ready to resume. */
+    private fun pauseForReschedule(configId: String, jobState: com.eko.uidt.JobState) {
+        jobState.resumableDownloader.pause(configId)
+        jobState.resumableDownloader.getState(configId)?.let { state ->
+            val bytesDownloaded = state.bytesDownloaded.get()
+            UIDTJobRegistry.pendingHeaders[configId] = state.headers
+            UIDTJobRegistry.saveResumeState(this, configId, state.headers, bytesDownloaded)
+            RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "onStopJob: saved resume state for $configId at $bytesDownloaded bytes")
+        }
+        UIDTJobRegistry.activeJobs.remove(configId)
+    }
+
     private fun createJobListener(
         configId: String,
         params: JobParameters,
         groupId: String,
         groupName: String,
-        customTitle: String = ""
+        customTitle: String = "",
+        // Set when the transfer is one item of a batch job: finishing it completes
+        // that item and asks for the next, instead of ending the job for everyone.
+        workItem: JobWorkItem? = null,
+        isAllowedOverMetered: Boolean = true,
     ): ResumableDownloader.DownloadListener {
+        fun finishWork() {
+            if (workItem == null) {
+                jobFinished(params, false)
+                return
+            }
+            try {
+                params.completeWork(workItem)
+            } catch (error: Exception) {
+                RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "completeWork refused for $configId: ${error.message}")
+            }
+            pumpBatchWork(params, groupId, isAllowedOverMetered)
+        }
+
         return object : ResumableDownloader.DownloadListener {
             override fun onBegin(id: String, expectedBytes: Long, headers: Map<String, String>) {
                 RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "UIDT download begin: $id, expectedBytes: $expectedBytes")
@@ -499,10 +688,11 @@ class UIDTDownloadJobService : JobService() {
                 }
 
                 // Signal job completion - this triggers the REMOVE policy
-                jobFinished(params, false)
+                finishWork()
 
                 // Clear persisted resume state - no longer needed after successful completion
                 UIDTJobRegistry.clearResumeState(this@UIDTDownloadJobService, id)
+                UIDTJobRegistry.clearBatchItem(this@UIDTDownloadJobService, id)
                 // The progress notification is gone; the completion one above already
                 // took its ID from this offset, so it can go back to the pool
                 UIDTNotificationIds.release(id)
@@ -547,10 +737,11 @@ class UIDTDownloadJobService : JobService() {
                 }
 
                 // Signal job completion with no reschedule - this triggers the REMOVE policy
-                jobFinished(params, false)
+                finishWork()
 
                 // Clear persisted resume state - no longer needed after failure
                 UIDTJobRegistry.clearResumeState(this@UIDTDownloadJobService, id)
+                UIDTJobRegistry.clearBatchItem(this@UIDTDownloadJobService, id)
                 UIDTNotificationIds.release(id)
 
                 // Notify external listener

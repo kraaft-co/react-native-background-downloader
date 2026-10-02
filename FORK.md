@@ -87,6 +87,52 @@ string)`, but the function form never reaches Android:
 `getNotificationTextsForNative` discards it and substitutes the English
 default. Pass a plain string.
 
+### One job per group, not per file
+
+`android/src/main/java/com/eko/uidt/UIDTJobManager.kt`,
+`android/src/main/java/com/eko/uidt/UIDTJobIds.kt`,
+`android/src/main/java/com/eko/UIDTDownloadJobService.kt`
+
+One job per file does not scale past the per-app job limit: `scheduleDownload`
+refused once the app held 120 pending jobs (the platform allows 150 from Android
+12, the library keeps 30 in reserve) and fell back to the foreground service — a
+second mechanism with a second notification. That limit is shared with everything
+else the app schedules, WorkManager included.
+
+A grouped download now joins its batch's single job through
+`JobScheduler.enqueue(JobInfo, JobWorkItem)`, dequeued with
+`JobParameters.dequeueWork()` and retired with `completeWork()`. One job and one
+notification cover the batch whatever its size. Concurrency stays the existing
+`maxParallelDownloads`, which `ResumableDownloader` already enforces.
+
+Batching applies only to `summaryOnly` grouping, the mode that asks for a single
+notification; the others keep a job per download, because the platform ties one
+notification to one job.
+
+The batch is keyed by `(groupId, isAllowedOverMetered)`, not by `groupId` alone.
+The flag becomes the job's `setRequiredNetwork` constraint and a job carries
+exactly one, so a group mixing "cellular is fine" with "Wi-Fi only" needs one job
+per answer — otherwise one of the two is betrayed. That is at most two jobs per
+group.
+
+Three consequences are handled rather than inherited:
+
+- `enqueue` is refused while the app is not visible, which a probe against
+  Android 16 confirmed. A refusal falls through to a job for that download alone.
+- A cancelled download reports to no listener (`ResumableDownloader.cancel` is
+  explicit about it), so cancelling one item retires its work item by hand. An
+  item cannot be pulled out of the system's queue, so one cancelled before its
+  turn is marked and skipped when it is dequeued.
+- A batch job's extras name the group, not the files, and the work queue cannot
+  be read back, so `getExistingDownloads` would miss everything still queued.
+  Each enqueue records what it is downloading, and the records are dropped with
+  their batch job.
+
+Measured on a Samsung SM-A566B (Android 16) with `example/`, five downloads at
+once: upstream takes five job slots and posts seven notifications; this branch
+takes one slot and posts one. With `summaryOnly` off, both take five slots and
+post five notifications plus a summary.
+
 ## Build changes
 
 `packageManager` is set to the monorepo's pnpm pin rather than yarn. Left at
@@ -110,16 +156,3 @@ The patches touch two Android files only; the JS side is untouched, so a
 rebase conflicts only where upstream has reworked the UIDT notification code.
 If upstream adopts the shared-notification approach, drop the first patch.
 
-## Known upstream limits, not patched here
-
-`UIDTJobManager.scheduleDownload` refuses once the app holds 120 pending jobs
-(the platform allows 150 from Android 12, and the library keeps 30 in reserve),
-and falls back to the foreground service — a second mechanism with a second
-notification. One job per file cannot scale past a per-app job limit. The
-platform's own answer is `JobScheduler.enqueue(JobInfo, JobWorkItem)`: one job
-carrying a queue of work items, dequeued with `JobParameters.dequeueWork()` and
-finished with `completeWork()`. A probe against Android 16 confirmed that this
-composes with `setUserInitiated(true)`, that five items cost one job slot, that
-items can be dequeued and run in parallel, and that one notification covers the
-batch by construction. It also confirmed that `enqueue` is refused while the
-app is not running, so such a job can only be scheduled from the foreground.

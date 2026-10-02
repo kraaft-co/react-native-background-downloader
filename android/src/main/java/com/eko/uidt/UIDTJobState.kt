@@ -1,6 +1,7 @@
 package com.eko.uidt
 
 import android.app.job.JobParameters
+import android.app.job.JobWorkItem
 import android.content.Context
 import com.eko.RNBackgroundDownloaderModuleImpl
 import com.eko.ResumableDownloader
@@ -23,6 +24,8 @@ data class JobState(
     // metadata.groupTapUrl). Empty means "just bring the app to the front".
     val tapUrl: String = "",
     val groupTapUrl: String = "",
+    // The batch work item this download runs as, when it is part of a batch job.
+    val workItem: JobWorkItem? = null,
     var lastNotifiedProgress: Int = -1,
     var lastNotificationUpdateTime: Long = 0,
     // Track download progress for summary notification
@@ -158,6 +161,11 @@ object UIDTConstants {
     const val KEY_METADATA = "metadata"
     const val KEY_IS_ALLOWED_OVER_METERED = "is_allowed_over_metered"
 
+    // A batch job carries its group on the JobInfo and each download on a work
+    // item, so one job covers the whole group instead of one job per file.
+    const val KEY_GROUP_ID = "group_id"
+    const val KEY_IS_BATCH = "is_batch"
+
     // Notification channel for UIDT jobs (visible notifications)
     const val NOTIFICATION_CHANNEL_ID = "uidt_download_channel"
 
@@ -209,6 +217,7 @@ object UIDTJobRegistry {
     private const val PREFS_NAME = "rnbd_uidt_resume"
     private const val KEY_BYTES_PREFIX = "bytes_"
     private const val KEY_HEADERS_PREFIX = "headers_"
+    private const val KEY_BATCH_ITEM_PREFIX = "batchitem_"
 
     /**
      * Persist UIDT resume state (headers + byte position) to disk so it
@@ -246,6 +255,64 @@ object UIDTJobRegistry {
         } catch (e: Exception) {
             RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to load UIDT resume state for $configId: ${e.message}")
             return null
+        }
+    }
+
+    /**
+     * Remember what a batch work item is downloading. A batch job's extras name
+     * the group, not the files, and the system's work queue cannot be read back -
+     * so without this a download waiting its turn is invisible to
+     * getExistingDownloads and looks stuck after the app restarts.
+     */
+    fun saveBatchItem(
+        context: Context,
+        configId: String,
+        url: String,
+        destination: String,
+        totalBytes: Long,
+        metadata: String,
+        groupId: String,
+        isAllowedOverMetered: Boolean,
+    ) {
+        try {
+            val json = JSONObject()
+                .put("url", url)
+                .put("destination", destination)
+                .put("totalBytes", totalBytes)
+                .put("metadata", metadata)
+                .put("groupId", groupId)
+                .put("metered", isAllowedOverMetered)
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString("$KEY_BATCH_ITEM_PREFIX$configId", json.toString())
+                .apply()
+        } catch (e: Exception) {
+            RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to save batch item $configId: ${e.message}")
+        }
+    }
+
+    /** Every remembered batch item, as (configId, fields). */
+    fun loadBatchItems(context: Context): Map<String, JSONObject> {
+        return try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).all
+                .filterKeys { it.startsWith(KEY_BATCH_ITEM_PREFIX) }
+                .mapNotNull { (key, value) ->
+                    val raw = value as? String ?: return@mapNotNull null
+                    key.removePrefix(KEY_BATCH_ITEM_PREFIX) to JSONObject(raw)
+                }
+                .toMap()
+        } catch (e: Exception) {
+            RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to read batch items: ${e.message}")
+            emptyMap()
+        }
+    }
+
+    fun clearBatchItem(context: Context, configId: String) {
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .remove("$KEY_BATCH_ITEM_PREFIX$configId")
+                .apply()
+        } catch (e: Exception) {
+            RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to clear batch item $configId: ${e.message}")
         }
     }
 
@@ -349,6 +416,22 @@ object UIDTJobRegistry {
      * Whether every download enrolled in the group has finished. Unlike counting
      * the live jobs, this also waits for the ones whose job has not started yet.
      */
+    /**
+     * Downloads cancelled while queued behind a batch job. A work item cannot be
+     * pulled out of the system's queue, so it is skipped when its turn comes.
+     */
+    private val cancelledBeforeStart = ConcurrentHashMap.newKeySet<String>()
+
+    fun markCancelled(configId: String) {
+        cancelledBeforeStart.add(configId)
+    }
+
+    fun isCancelled(configId: String): Boolean = cancelledBeforeStart.contains(configId)
+
+    fun clearCancelled(configId: String) {
+        cancelledBeforeStart.remove(configId)
+    }
+
     fun isGroupComplete(groupId: String): Boolean {
         if (groupId.isEmpty()) return false
         // A group with nothing left in it is over too - every file failed and was

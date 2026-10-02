@@ -32,6 +32,9 @@ internal object UIDTJobIds {
     /** configId -> ID picked but not yet handed to the JobScheduler. */
     private val reservations = mutableMapOf<String, Int>()
 
+    /** (groupId, isAllowedOverMetered) -> the batch job's ID, for as long as it lives. */
+    private val batchReservations = mutableMapOf<Pair<String, Boolean>, Int>()
+
     private val serviceName = UIDTDownloadJobService::class.java.name
 
     /**
@@ -47,6 +50,57 @@ internal object UIDTJobIds {
     fun configIdOf(job: JobInfo): String? {
         if (job.service.className != serviceName) return null
         return job.extras.getString(UIDTConstants.KEY_DOWNLOAD_ID)
+    }
+
+    /**
+     * The batch a scheduled job carries, as the `(groupId, isAllowedOverMetered)`
+     * pair it is keyed by, or null if it isn't a batch job of ours.
+     */
+    fun batchKeyOf(job: JobInfo): Pair<String, Boolean>? {
+        if (job.service.className != serviceName) return null
+        if (job.extras.getInt(UIDTConstants.KEY_IS_BATCH, 0) != 1) return null
+        val groupId = job.extras.getString(UIDTConstants.KEY_GROUP_ID) ?: return null
+        return groupId to (job.extras.getInt(UIDTConstants.KEY_IS_ALLOWED_OVER_METERED, 1) == 1)
+    }
+
+    /**
+     * The ID of the batch job for this group, scanning the same range as the
+     * per-download IDs so the two can never collide.
+     *
+     * The metered flag is part of the key because it becomes the job's network
+     * constraint, and a job carries exactly one: a group mixing "cellular is
+     * fine" with "Wi-Fi only" downloads needs one job per answer, or one of the
+     * two is betrayed.
+     */
+    fun batchJobIdFor(
+        groupId: String,
+        isAllowedOverMetered: Boolean,
+        pendingJobs: List<JobInfo>?,
+    ): Int? {
+        synchronized(lock) {
+            val key = groupId to isAllowedOverMetered
+            pendingJobs?.firstOrNull { batchKeyOf(it) == key }?.let { return it.id }
+            batchReservations[key]?.let { return it }
+
+            val used = pendingJobs.orEmpty().mapTo(mutableSetOf()) { it.id }
+            used.addAll(reservations.values)
+            used.addAll(batchReservations.values)
+
+            val seed = "$groupId|$isAllowedOverMetered".hashCode() and 0x7FFFFFFF
+            val start = seed % JOB_ID_RANGE
+            for (offset in 0 until JOB_ID_RANGE) {
+                val candidate = UIDTConstants.JOB_ID_BASE + (start + offset) % JOB_ID_RANGE
+                if (candidate in used) continue
+                batchReservations[key] = candidate
+                return candidate
+            }
+            return null
+        }
+    }
+
+    /** Forget a batch's ID once its job is gone, so the next batch picks a fresh one. */
+    fun releaseBatch(groupId: String, isAllowedOverMetered: Boolean) {
+        synchronized(lock) { batchReservations.remove(groupId to isAllowedOverMetered) }
     }
 
     /** Every download job the app currently has scheduled, running ones included. */
