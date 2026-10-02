@@ -25,13 +25,28 @@ class CancelDownloadReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_CANCEL_DOWNLOAD) return
-        val configId = intent.getStringExtra(EXTRA_CONFIG_ID) ?: return
 
+        // A batch's notification stands for the whole group, so its Cancel button
+        // cancels every download under it, running or still queued.
+        intent.getStringExtra(EXTRA_GROUP_ID)?.let { groupId ->
+            RNBackgroundDownloaderModuleImpl.logD(
+                UIDTConstants.TAG,
+                "CancelDownloadReceiver: cancelling group '$groupId'",
+            )
+            UIDTJobManager.downloadsInGroup(context, groupId).forEach { cancelOne(context, it) }
+            UIDTJobManager.finishGroup(context, groupId)
+            return
+        }
+
+        val configId = intent.getStringExtra(EXTRA_CONFIG_ID) ?: return
         RNBackgroundDownloaderModuleImpl.logD(
             UIDTConstants.TAG,
             "CancelDownloadReceiver: cancelling $configId",
         )
+        cancelOne(context, configId)
+    }
 
+    private fun cancelOne(context: Context, configId: String) {
         // Snapshot liveness first: stopTask tears the job down, so afterwards we
         // can no longer tell an active download from an already-finished one.
         val wasActive = UIDTJobRegistry.isActiveJob(configId)
@@ -57,6 +72,7 @@ class CancelDownloadReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_CANCEL_DOWNLOAD = "com.eko.uidt.ACTION_CANCEL_DOWNLOAD"
         const val EXTRA_CONFIG_ID = "config_id"
+        const val EXTRA_GROUP_ID = "group_id"
 
         private const val CANCELLED_MESSAGE = "Download cancelled by user"
         private const val CANCELLED_ERROR_CODE = -1

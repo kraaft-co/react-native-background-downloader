@@ -476,6 +476,47 @@ object UIDTJobManager {
     }
 
     /**
+     * Every download of a group the library still knows about: the ones running,
+     * plus the ones queued behind a batch job, which have no job of their own.
+     */
+    fun downloadsInGroup(context: Context, groupId: String): List<String> {
+        if (groupId.isEmpty()) return emptyList()
+
+        val running = UIDTJobRegistry.activeJobs.entries
+            .filter { it.value.groupId == groupId }
+            .map { it.key }
+        val queued = UIDTJobRegistry.loadBatchItems(context)
+            .filterValues { it.optString("groupId") == groupId }
+            .keys
+
+        return (running + queued).distinct()
+    }
+
+    /**
+     * Tear down what is left of a group once its downloads are cancelled: the batch
+     * job under each metered setting, its notification, and its progress tally.
+     */
+    fun finishGroup(context: Context, groupId: String) {
+        if (groupId.isEmpty()) return
+
+        val jobScheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+        val pending = pendingJobs(jobScheduler)
+        for (metered in listOf(true, false)) {
+            pending.orEmpty()
+                .firstOrNull { UIDTJobIds.batchKeyOf(it) == (groupId to metered) }
+                ?.let {
+                    jobScheduler.cancel(it.id)
+                    RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Cancelled batch job ${it.id} for group '$groupId'")
+                }
+            UIDTJobIds.releaseBatch(groupId, metered)
+        }
+
+        UIDTJobRegistry.markGroupFinalized(groupId)
+        UIDTNotificationManager.cancelSummaryNotification(context, groupId)
+        UIDTJobRegistry.clearGroupProgress(groupId)
+    }
+
+    /**
      * Cancel one download of a batch. The job and its notification belong to the
      * whole group, so neither is touched; the work item is retired by hand because
      * a cancelled download reports to no listener.

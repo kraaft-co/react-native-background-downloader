@@ -128,10 +128,22 @@ Three consequences are handled rather than inherited:
   Each enqueue records what it is downloading, and the records are dropped with
   their batch job.
 
+The batch notification stands for the whole group, so its Cancel button cancels
+every download under it — running or still queued — through the same path as
+`task.stop()`, then tears the job down. `CancelDownloadReceiver` takes
+`EXTRA_GROUP_ID` for that, alongside the per-download `EXTRA_CONFIG_ID`.
+
+The aggregate progress goes on with `JOB_END_NOTIFICATION_POLICY_REMOVE` rather
+than `DETACH`. DETACH exists for the case where several jobs share one id and an
+early finisher must not take it down; a batch is one job, so detaching outlived
+it — the last policy set wins, and a progress update racing after the final file's
+REMOVE left the notification posted for good, frozen on its last text.
+
 Measured on a Samsung SM-A566B (Android 16) with `example/`, five downloads at
 once: upstream takes five job slots and posts seven notifications; this branch
-takes one slot and posts one. With `summaryOnly` off, both take five slots and
-post five notifications plus a summary.
+takes one slot and posts one, and the shade is empty once the batch ends. With
+`summaryOnly` off, both take five slots and post five notifications plus a
+summary.
 
 ## Build changes
 

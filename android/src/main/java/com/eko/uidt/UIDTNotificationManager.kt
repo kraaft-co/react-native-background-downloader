@@ -171,6 +171,29 @@ object UIDTNotificationManager {
         )
     }
 
+    /** The batch notification's Cancel button, which stops the whole group. */
+    private fun applyGroupCancelAction(builder: NotificationCompat.Builder, context: Context, groupId: String) {
+        if (!config.showCancelAction || groupId.isEmpty()) return
+
+        val intent = Intent(context, CancelDownloadReceiver::class.java).apply {
+            action = CancelDownloadReceiver.ACTION_CANCEL_DOWNLOAD
+            setPackage(context.packageName)
+            putExtra(CancelDownloadReceiver.EXTRA_GROUP_ID, groupId)
+        }
+        val requestCode = getNotificationIdForGroup(groupId)
+
+        builder.addAction(
+            android.R.drawable.ic_menu_close_clear_cancel,
+            config.getText("downloadCancel"),
+            PendingIntent.getBroadcast(
+                context,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            ),
+        )
+    }
+
     private fun buildCancelPendingIntent(context: Context, configId: String): PendingIntent {
         val intent = Intent(context, CancelDownloadReceiver::class.java).apply {
             action = CancelDownloadReceiver.ACTION_CANCEL_DOWNLOAD
@@ -291,6 +314,7 @@ object UIDTNotificationManager {
 
         buildTapPendingIntent(context, groupTapUrl(groupId), getNotificationIdForGroup(groupId))
             ?.let(builder::setContentIntent)
+        applyGroupCancelAction(builder, context, groupId)
 
         return builder.build()
     }
@@ -577,6 +601,7 @@ object UIDTNotificationManager {
             .apply {
                 buildTapPendingIntent(context, groupTapUrl(groupId), summaryNotificationId)
                     ?.let(::setContentIntent)
+                applyGroupCancelAction(this, context, groupId)
             }
             .build()
 
@@ -592,6 +617,16 @@ object UIDTNotificationManager {
             ?.params
 
         if (sharesGroupNotification(groupId) && service != null && liveParams != null) {
+            // DETACH is for the case where several jobs share one notification id and
+            // an early finisher must not take it down. A batch is a single job, so
+            // detaching there outlives the job: the last policy set wins, and this
+            // update races after the REMOVE the final file sets.
+            val endPolicy = if (liveParams.extras.getInt(UIDTConstants.KEY_IS_BATCH, 0) == 1) {
+                JobService.JOB_END_NOTIFICATION_POLICY_REMOVE
+            } else {
+                JobService.JOB_END_NOTIFICATION_POLICY_DETACH
+            }
+
             // The job it rides on can finish between the lookup and the call, and the
             // platform refuses a notification for a job that is no longer running.
             try {
@@ -599,7 +634,7 @@ object UIDTNotificationManager {
                     liveParams,
                     getNotificationIdForGroup(groupId),
                     progressNotification,
-                    JobService.JOB_END_NOTIFICATION_POLICY_DETACH
+                    endPolicy
                 )
             } catch (error: Exception) {
                 RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Shared notification update refused: ${error.message}")
@@ -662,6 +697,10 @@ object UIDTNotificationManager {
         // Also cancel the hidden group summary
         val hiddenGroupSummaryId = summaryNotificationId + 1
         notificationManager.cancel(hiddenGroupSummaryId)
+
+        // The shared/batch notification sets no group key, so the sweep below never
+        // matches it; a job that ended without applying REMOVE would leave it posted.
+        notificationManager.cancel(getNotificationIdForGroup(groupId))
 
         // First, cancel all active status bar notifications to ensure the group is completely removed
         // This prevents Android from auto-recreating a group summary from orphaned child notifications
