@@ -127,18 +127,22 @@ class GroupProgress {
     val downloadedBytes: Long get() = files.values.sumOf { it.bytesDownloaded }
     val totalBytes: Long get() = files.values.sumOf { if (it.bytesTotal > 0) it.bytesTotal else 0L }
 
-    /**
-     * Only every known size makes the bar honest: with one size still missing the
-     * denominator is short, and the bar would jump backwards when it arrives.
-     * Passing `totalBytes` to the download avoids the indeterminate phase.
-     */
+    /** Whether byte totals are known, independently of file-weighted progress. */
     val hasKnownTotal: Boolean get() = files.isNotEmpty() && files.values.all { it.bytesTotal > 0 }
 
+    /** Every registered file contributes an equal share, including queued files. */
     val progressPercent: Int
-        get() = if (hasKnownTotal && totalBytes > 0) {
-            ((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 100)
-        } else {
-            0
+        get() {
+            val snapshot = files.values.toList()
+            if (snapshot.isEmpty()) return 0
+            val completedShares = snapshot.sumOf { file ->
+                when {
+                    file.completed -> 1.0
+                    file.bytesTotal > 0 -> (file.bytesDownloaded.toDouble() / file.bytesTotal).coerceIn(0.0, 1.0)
+                    else -> 0.0
+                }
+            }
+            return (completedShares * 100 / snapshot.size).toInt().coerceIn(0, 100)
         }
 }
 

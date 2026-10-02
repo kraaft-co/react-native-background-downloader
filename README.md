@@ -805,6 +805,8 @@ When downloading many files (e.g., thousands of photos), you can use the `mode` 
 | `'individual'` | Default. Shows all individual notifications grouped together with a summary |
 | `'summaryOnly'` | Shows only ONE notification with real-time aggregate progress (e.g., "45% - 5 files"). Individual UIDT notifications are collapsed into an invisible group. Ideal for bulk downloads |
 
+Group progress gives each registered file an equal share. A completed file contributes its full share; a running file contributes the fraction of its bytes downloaded. Queued files with unknown sizes contribute zero until they start. For example, 60 completed files out of 100 show 60%, even if the remaining file sizes are unknown. `{count}` in `groupText` is the number of files remaining.
+
 ```javascript
 import { setConfig } from '@kesha-antonov/react-native-background-downloader'
 

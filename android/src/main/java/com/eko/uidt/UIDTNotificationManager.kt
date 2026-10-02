@@ -569,7 +569,8 @@ object UIDTNotificationManager {
         val totalBytesDownloaded = tally.downloadedBytes
         val totalBytesTotal = tally.totalBytes
         val progress = tally.progressPercent
-        val indeterminate = !tally.hasKnownTotal
+        // File count gives us a denominator even before queued file sizes arrive.
+        val indeterminate = false
 
         val groupKey = "${UIDTConstants.NOTIFICATION_GROUP_KEY}_$groupId"
         val title = groupName.ifEmpty { config.getText("groupTitle") }
