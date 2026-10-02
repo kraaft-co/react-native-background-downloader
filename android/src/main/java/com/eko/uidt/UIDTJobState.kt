@@ -19,6 +19,10 @@ data class JobState(
     // Optional per-download notification title (read from metadata.notificationTitle).
     // When non-empty, overrides both groupName and the config's default downloadTitle.
     val customTitle: String = "",
+    // Deep links the app wants its notifications to open (metadata.tapUrl /
+    // metadata.groupTapUrl). Empty means "just bring the app to the front".
+    val tapUrl: String = "",
+    val groupTapUrl: String = "",
     var lastNotifiedProgress: Int = -1,
     var lastNotificationUpdateTime: Long = 0,
     // Track download progress for summary notification

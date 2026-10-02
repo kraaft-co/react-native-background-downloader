@@ -130,7 +130,23 @@ export interface ErrorHandlerParams {
 
 export type ErrorHandler = (params: ErrorHandlerParams) => void
 
-export type Metadata = Record<string, unknown>
+export type Metadata = Record<string, unknown> & {
+  /** Groups downloads under one notification (Android 14+). */
+  groupId?: string
+  /** Group name shown as the notification title (Android 14+). */
+  groupName?: string
+  /** Notification title for this download alone (Android 14+). */
+  notificationTitle?: string
+  /**
+   * Deep link this download's notification opens when tapped (Android 14+).
+   * Must resolve inside the app; otherwise the tap is left unhandled. Without
+   * one the notification brings the app to the front, except the completion
+   * notification, which keeps opening the file in the system viewer.
+   */
+  tapUrl?: string
+  /** Deep link the group's notification opens when tapped (Android 14+). */
+  groupTapUrl?: string
+}
 
 export interface TaskInfoNative {
   id: string

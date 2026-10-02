@@ -196,12 +196,16 @@ class UIDTDownloadJobService : JobService() {
         var groupId = ""
         var groupName = ""
         var customTitle = ""
+        var tapUrl = ""
+        var groupTapUrl = ""
         RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "onStartJob: configId=$configId, metadataJson=$metadataJson")
         try {
             val json = JSONObject(metadataJson)
             groupId = json.optString("groupId", "")
             groupName = json.optString("groupName", "")
             customTitle = json.optString("notificationTitle", "")
+            tapUrl = json.optString("tapUrl", "")
+            groupTapUrl = json.optString("groupTapUrl", "")
             RNBackgroundDownloaderModuleImpl.logD(UIDTConstants.TAG, "Parsed metadata: groupId='$groupId', groupName='$groupName', customTitle='$customTitle'")
         } catch (e: Exception) {
             RNBackgroundDownloaderModuleImpl.logE(UIDTConstants.TAG, "Failed to parse metadata: ${e.message}")
@@ -258,7 +262,8 @@ class UIDTDownloadJobService : JobService() {
             configId,
             if (sharesGroupNotification) "" else groupId,
             groupName,
-            customTitle
+            customTitle,
+            if (sharesGroupNotification) groupTapUrl else tapUrl
         )
 
         // Set the notification for this job (required for UIDT)
@@ -276,7 +281,7 @@ class UIDTDownloadJobService : JobService() {
         }
 
         // Store job state BEFORE updating summary (so count includes this job)
-        UIDTJobRegistry.activeJobs[configId] = JobState(params, resumableDownloader, notificationId, groupId, groupName, customTitle)
+        UIDTJobRegistry.activeJobs[configId] = JobState(params, resumableDownloader, notificationId, groupId, groupName, customTitle, tapUrl, groupTapUrl)
 
         // Update summary notification if grouping enabled (now includes new job in count)
         UIDTNotificationManager.updateSummaryNotificationForGroup(this, groupId, groupName)
@@ -453,6 +458,7 @@ class UIDTDownloadJobService : JobService() {
                     displayName,
                     jobState?.groupId ?: groupId,
                     jobState?.customTitle ?: customTitle,
+                    jobState?.tapUrl ?: "",
                 )
 
                 // Clean up - remove from activeJobs first

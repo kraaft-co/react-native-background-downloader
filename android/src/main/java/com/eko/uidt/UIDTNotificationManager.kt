@@ -135,6 +135,42 @@ object UIDTNotificationManager {
         )
     }
 
+    /** The deep link the group's notification opens, as its jobs declared it. */
+    private fun groupTapUrl(groupId: String): String =
+        UIDTJobRegistry.activeJobs.values.firstOrNull { it.groupId == groupId }?.groupTapUrl ?: ""
+
+    /**
+     * What tapping a download notification does. With a deep link from the app's
+     * metadata it opens that link, scoped to the app so no other handler can claim
+     * it; without one it just brings the app to the front. Null when the app has no
+     * launcher activity, which leaves the notification untappable as before.
+     */
+    private fun buildTapPendingIntent(context: Context, tapUrl: String, requestCode: Int): PendingIntent? {
+        val intent = if (tapUrl.isNotEmpty()) {
+            Intent(Intent.ACTION_VIEW, Uri.parse(tapUrl)).apply {
+                setPackage(context.packageName)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else {
+            context.packageManager.getLaunchIntentForPackage(context.packageName)
+                ?.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                ?: return null
+        }
+
+        // A deep link nothing handles would throw at tap time, so check it now.
+        if (intent.resolveActivity(context.packageManager) == null) {
+            RNBackgroundDownloaderModuleImpl.logW(UIDTConstants.TAG, "No activity handles the notification tap url '$tapUrl'")
+            return null
+        }
+
+        return PendingIntent.getActivity(
+            context,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
+
     private fun buildCancelPendingIntent(context: Context, configId: String): PendingIntent {
         val intent = Intent(context, CancelDownloadReceiver::class.java).apply {
             action = CancelDownloadReceiver.ACTION_CANCEL_DOWNLOAD
@@ -160,7 +196,8 @@ object UIDTNotificationManager {
         configId: String,
         groupId: String = "",
         groupName: String = "",
-        customTitle: String = ""
+        customTitle: String = "",
+        tapUrl: String = ""
     ): Notification {
         val isSummaryOnlyMode = config.mode == NotificationGroupingMode.SUMMARY_ONLY
 
@@ -216,6 +253,9 @@ object UIDTNotificationManager {
             .setShowWhen(false)
             .setProgress(0, 0, true)
 
+        buildTapPendingIntent(context, tapUrl, getNotificationIdForConfig(configId))
+            ?.let(builder::setContentIntent)
+
         applyCancelAction(builder, context, configId)
 
         // Apply grouping when enabled and groupId is provided
@@ -269,6 +309,9 @@ object UIDTNotificationManager {
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setProgress(100, progress, bytesTotal <= 0)
+
+        buildTapPendingIntent(context, jobState.tapUrl, jobState.notificationId)
+            ?.let(builder::setContentIntent)
 
         applyCancelAction(builder, context, configId)
 
@@ -434,6 +477,10 @@ object UIDTNotificationManager {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
+            .apply {
+                buildTapPendingIntent(context, groupTapUrl(groupId), summaryNotificationId)
+                    ?.let(::setContentIntent)
+            }
             .build()
 
         notificationManager.notify(summaryNotificationId, summaryNotification)
@@ -499,6 +546,10 @@ object UIDTNotificationManager {
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setProgress(100, progress, indeterminate)
+            .apply {
+                buildTapPendingIntent(context, groupTapUrl(groupId), summaryNotificationId)
+                    ?.let(::setContentIntent)
+            }
             .build()
 
         // When the jobs share a notification id, that one notification is all the user
@@ -645,6 +696,7 @@ object UIDTNotificationManager {
         fileName: String,
         groupId: String = "",
         customTitle: String = "",
+        tapUrl: String = "",
     ) {
         if (!config.showNotificationsEnabled || !config.showCompletionNotification) return
 
@@ -676,7 +728,10 @@ object UIDTNotificationManager {
         // only fall back to auto-detecting a host-app provider if that fails.
         // If neither produces a URI the tap action is simply omitted and the
         // notification is still posted.
-        val pendingIntent: PendingIntent? = try {
+        val pendingIntent: PendingIntent? = tapUrl
+            .takeIf { it.isNotEmpty() }
+            ?.let { buildTapPendingIntent(context, it, notificationId) }
+            ?: try {
             val file = File(destination)
             val uri = resolveContentUri(context, file)
             val mime = URLConnection.guessContentTypeFromName(fileName) ?: "*/*"
