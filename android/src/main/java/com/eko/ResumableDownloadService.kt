@@ -194,6 +194,9 @@ class ResumableDownloadService : Service() {
     super.onCreate()
     RNBackgroundDownloaderModuleImpl.logD(TAG, "Service created")
     createNotificationChannel()
+    // A process killed while its notification was up leaves it behind, ongoing
+    // and undismissable; a fresh service holds no download, so it is stale.
+    cancelNotification()
   }
 
   /**
@@ -499,8 +502,17 @@ class ResumableDownloadService : Service() {
   }
 
   private fun updateNotification() {
+    // Outside the foreground (startForeground refused from the background on
+    // Android 12+), a notify() posts a plain ongoing notification that
+    // stopForeground() never removes.
+    if (!isForeground) return
     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notificationManager.notify(DownloadConstants.NOTIFICATION_ID, createNotification())
+  }
+
+  private fun cancelNotification() {
+    val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    notificationManager.cancel(DownloadConstants.NOTIFICATION_ID)
   }
 
   private fun acquireWakeLock() {
@@ -536,6 +548,7 @@ class ResumableDownloadService : Service() {
       RNBackgroundDownloaderModuleImpl.logD(TAG, "No active downloads, stopping service")
       releaseWakeLock()
       stopForeground(STOP_FOREGROUND_REMOVE)
+      cancelNotification()
       isForeground = false
       stopSelf()
     } else {
