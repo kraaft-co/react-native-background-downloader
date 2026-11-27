@@ -157,6 +157,18 @@ install, but an up-to-date install skips it — which is why
 `.gitlab/workspace/install.sh` rebuilds the output when it is missing. Metro is
 unaffected either way, since `react-native` points at `src/index.ts`.
 
+`typescript` is the monorepo's version, 7.0.2, which changes three things:
+
+- `tsconfig.build.json` resolves modules as `bundler` instead of `node`:
+  typescript 7 rejects `node` (node10) with TS5107. The output is still
+  CommonJS and its declarations are unchanged; three files in `lib/` now
+  declare typescript's temporary variables in two `var` statements instead of
+  one.
+- `build-plugin` passes `--types node`, and `@types/node` is a devDependency.
+  Since typescript 6 a build no longer loads every installed `@types` package
+  on its own, and the plugin uses `fs`, `path` and `process`. The emitted
+  `plugin/build` is unchanged.
+
 ## Rebasing onto a newer upstream release
 
 ```sh
